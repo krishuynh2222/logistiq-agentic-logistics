@@ -15,7 +15,7 @@ This project simulates a real-world logistics decision system that:
 ###### ⚡ Designed to mimic how modern logistics companies automate operations with AI + data systems.
 
 ## 🏗️ Architecture
-
+![Workflow](images/n8n_workflow.png)
 ## ⚙️ Core Features
 #### 📦 1. Data Ingestion
 - Reads real shipment data from Google Sheets
@@ -59,11 +59,24 @@ This project simulates a real-world logistics decision system that:
 - Optimized routes
 - Driver HOS status
 - RL performance panel
-  
+
+<p align="center">
+  <img src="images/dashboard.png" width="800"/>
+</p>
+
 **Mobile App**
 - Real-time pipeline execution
 - Lightweight route view
 - Live system logs
+
+<p align="center">
+  <img src="images/mobile.png" width="400"/>
+</p>
+
+**Mail**
+<p align="center">
+  <img src="images/mail.png" width="800"/>
+</p>
 
 #### 🎯 Business Impact
 
@@ -78,4 +91,5 @@ This system demonstrates how logistics companies can:
 #### 👤 Author
 
 **Kris Huynh**
+
 Computer Science @ NJCU 
