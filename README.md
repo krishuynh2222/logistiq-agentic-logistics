@@ -1,21 +1,35 @@
 # 🚀 Agentic AI Logistics Optimization System
-A real-time, AI-assisted logistics pipeline that optimizes delivery routes, evaluates operational risk, and automates dispatch decisions using deterministic algorithms + AI-powered insights.
+A real-time, AI-powered logistics decision system that optimizes routes, evaluates risk, and automates dispatch — built with n8n, Google Sheets, and custom optimization logic.
 
-## Overview
+## Why This Project Matters
 
-This project simulates a real-world logistics decision system that:
+Most logistics operations still rely on:
 
-- Ingests live shipment data from Google Sheets
-- Optimizes delivery routes using algorithmic logic (VRP-style)
-- Evaluates operational risk (traffic, HOS compliance, capacity)
-- Makes autonomous decisions (Approve / Review / Halt)
-- Executes actions (write routes, send email notifications)
-- Displays results in a live dashboard (Web + Mobile UI)
+- Manual route planning
+- Spreadsheet-based tracking
+- Delayed decision-making
+
+This system replaces that with:
+
+- Automated route optimization
+- Real-time risk evaluation
+- AI-assisted decision-making
+- End-to-end execution (dispatch + email)
 
 ###### ⚡ Designed to mimic how modern logistics companies automate operations with AI + data systems.
 
-## 🏗️ Architecture
+## System Workflow
 ![Workflow](images/n8n_workflow.png)
+
+## 📊 Dashboard (Real Output)
+<p align="center"> <img src="images/dashboard.png" width="900"/> </p>
+
+## 📱 Mobile Interface
+<p align="center"> <img src="images/mobile.png" width="350"/> </p>
+
+## 📧 Automated Email Dispatch
+<p align="center"> <img src="images/mail.png" width="700"/> </p>
+
 ## ⚙️ Core Features
 #### 📦 1. Data Ingestion
 - Reads real shipment data from Google Sheets
@@ -51,32 +65,6 @@ This project simulates a real-world logistics decision system that:
   - Risk level
   - Decision quality
 - Enables future extension into Reinforcement Learning
-  
-#### 📊 6. Dashboard UI
-**Web Dashboard**
-- Decision summary
-- Cost + risk metrics
-- Optimized routes
-- Driver HOS status
-- RL performance panel
-
-<p align="center">
-  <img src="images/dashboard.png" width="800"/>
-</p>
-
-**Mobile App**
-- Real-time pipeline execution
-- Lightweight route view
-- Live system logs
-
-<p align="center">
-  <img src="images/mobile.png" width="400"/>
-</p>
-
-**Mail**
-<p align="center">
-  <img src="images/mail.png" width="800"/>
-</p>
 
 #### 🎯 Business Impact
 
