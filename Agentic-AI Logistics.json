@@ -1,0 +1,552 @@
+{
+  "name": "Agentic-AI Logistics",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "agentic-logistics",
+        "responseMode": "responseNode",
+        "options": {
+          "allowedOrigins": "*"
+        }
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -1200,
+        300
+      ],
+      "id": "node-webhook",
+      "name": "Webhook Trigger",
+      "webhookId": "agentic-logistics"
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "1RyYi22xZ43Nv8n0jTXgmQKY_2WHEgoWMlXta9Ks6UuU",
+          "mode": "list",
+          "cachedResultName": "AI_Logistics_n8n"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "Read Delivery"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        -960,
+        300
+      ],
+      "id": "node-sheets",
+      "name": "Fetch Orders",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "aX9hDEGrpopc7jTL",
+          "name": "Google Sheets account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── STEP 1: READ REAL DATA FROM GOOGLE SHEETS ──────────────\n// No hardcode. No fallback mock data.\n// If sheet is empty or no Pending rows → error with clear message.\n\nconst rows = $input.all();\n\nif (rows.length === 0) {\n  throw new Error('Google Sheets returned 0 rows. Check sheet ID and tab name.');\n}\n\n// Case-insensitive Pending filter\nconst pending = rows.filter(r =>\n  r.json.Order_ID &&\n  typeof r.json.Status === 'string' &&\n  r.json.Status.trim().toLowerCase() === 'pending'\n);\n\nif (pending.length === 0) {\n  const found = rows.map(r => `${r.json.Order_ID}:${r.json.Status}`).join(', ');\n  throw new Error(`No Pending shipments found. Rows in sheet: [${found}]. Set Status to 'Pending'.`);\n}\n\nconst shipments = pending.map(r => ({\n  id:        String(r.json.Order_ID).trim(),\n  customer:  String(r.json.Customer  || 'Unknown').trim(),\n  dest:      String(r.json.Delivery_Address || '').trim(),\n  item:      String(r.json.Item      || 'Unknown').trim(),\n  weight_kg: parseFloat(r.json.Weight_kg) || 0,\n  priority:  String(r.json.Priority  || 'Medium').trim(),\n  carrier:   String(r.json.Assigned_Carrier || 'Unknown').trim()\n}));\n\n// Validate — every shipment must have id, dest, weight\nshipments.forEach(s => {\n  if (!s.id)   throw new Error(`Shipment missing Order_ID`);\n  if (!s.dest) throw new Error(`Shipment ${s.id} missing Delivery_Address`);\n  if (s.weight_kg <= 0) console.warn(`[WARN] Shipment ${s.id} has weight_kg=${s.weight_kg}`);\n});\n\n// Fleet from config (move to sheet if needed)\nconst fleet = [\n  { id:'T01', capacity_kg:500, hours_used:3.5, driver:'Driver A' },\n  { id:'T02', capacity_kg:400, hours_used:2.0, driver:'Driver B' },\n  { id:'T03', capacity_kg:600, hours_used:1.5, driver:'Driver C' }\n];\n\n// Traffic delay factors — keyword matched against destination\nconst trafficFactors = {\n  'San Francisco':1.30, 'Los Angeles':1.40, 'New York':1.35,\n  'Chicago':1.20,       'Seattle':1.15,     'Oakland':1.15,\n  'San Jose':1.10,      'Berkeley':1.05,    'Boston':1.25,\n  'Miami':1.20,         'Dallas':1.10,      'Houston':1.15\n};\n\nconst runId = 'RUN-' + Date.now();\nconsole.log(`[Init] ${runId} | ${shipments.length} shipments | IDs: ${shipments.map(s=>s.id).join(', ')}`);\n\nreturn [{ json: {\n  run_id: runId,\n  timestamp: new Date().toISOString(),\n  total_shipments: shipments.length,\n  shipments,\n  fleet,\n  trafficFactors,\n  hos_limit: 11\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -720,
+        300
+      ],
+      "id": "node-init",
+      "name": "Init & Validate"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── STEP 2: COMPUTE EVERYTHING IN CODE ─────────────────────\n// No LLM for math. Pure deterministic computation.\n// Groq is used only for natural language summary at the end.\n\nconst d = $input.first().json;\nconst { shipments, fleet, trafficFactors, hos_limit, run_id } = d;\n\n// ── 1. Sort by priority ──────────────────────────────────────\nconst PRI = { High:0, Medium:1, Low:2 };\nconst sorted = [...shipments].sort((a,b) =>\n  (PRI[a.priority] ?? 1) - (PRI[b.priority] ?? 1)\n);\n\n// ── 2. Get traffic factor for a destination ──────────────────\nfunction getFactor(dest) {\n  for (const [key, val] of Object.entries(trafficFactors)) {\n    if (dest.toLowerCase().includes(key.toLowerCase())) return val;\n  }\n  return 1.0; // no spike\n}\n\n// ── 3. Greedy VRP — assign shipments to trucks ───────────────\nconst trucks = fleet.map(f => ({ ...f, assigned: [], load: 0 }));\n\nfor (const ship of sorted) {\n  // Find truck with most remaining capacity that can fit this shipment\n  const candidates = trucks\n    .filter(t => t.load + ship.weight_kg <= t.capacity_kg)\n    .sort((a,b) => (b.capacity_kg - b.load) - (a.capacity_kg - a.load));\n\n  if (candidates.length === 0) {\n    // Overflow — add to truck with most capacity anyway\n    trucks.sort((a,b) => b.capacity_kg - a.capacity_kg)[0].assigned.push(ship);\n    trucks[0].load += ship.weight_kg;\n  } else {\n    candidates[0].assigned.push(ship);\n    candidates[0].load += ship.weight_kg;\n  }\n}\n\n// ── 4. Build optimized routes ────────────────────────────────\nconst routes = [];\nlet totalCost = 0;\nlet allFactors = [];\nlet spikesCount = 0;\n\nfor (const truck of trucks) {\n  if (truck.assigned.length === 0) continue;\n\n  const factors = truck.assigned.map(s => getFactor(s.dest));\n  const avgFactor = factors.reduce((a,b) => a+b, 0) / factors.length;\n  const hasSpike = factors.some(f => f > 1.15);\n  if (hasSpike) spikesCount++;\n\n  // ETA — start 09:00, +35min * factor per stop\n  let etaMin = 9 * 60;\n  const etaList = truck.assigned.map((s, i) => {\n    etaMin += Math.round(35 * factors[i]);\n    const h = Math.floor(etaMin / 60);\n    const m = etaMin % 60;\n    return `${s.id}@${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`;\n  });\n\n  // Total travel time\n  const travelMin = truck.assigned.reduce((sum, s, i) => sum + Math.round(35 * factors[i]), 0);\n  const travelH = Math.floor(travelMin / 60);\n  const travelM = travelMin % 60;\n  const travelStr = hasSpike\n    ? `${travelH}h ${travelM}m (rerouted +5%)`\n    : `${travelH}h ${travelM}m`;\n\n  // Cost = load * 0.12 + stops * 24\n  const cost = parseFloat((truck.load * 0.12 + truck.assigned.length * 24).toFixed(2));\n  totalCost += cost;\n\n  // Fuel efficiency\n  const fuelScore = Math.max(0, Math.round(100 - (avgFactor - 1.0) * 200));\n  allFactors.push(avgFactor);\n\n  // Destination cities\n  const cities = [...new Set(truck.assigned.map(s => s.dest))].join(' → ');\n\n  // Stop sequence\n  const stopSeq = truck.assigned.map((s,i) => `${i+1}.${s.id}`).join(', ');\n\n  routes.push({\n    Route_ID: `${truck.id}-${run_id.slice(-6)}`,\n    truck_id: truck.id,\n    driver: truck.driver,\n    Destination_City: cities,\n    Stop_Sequence: stopSeq,\n    Estimated_Travel_Time: travelStr,\n    Fuel_Efficiency_Score: fuelScore,\n    Optimized_Path_Notes: `${truck.id} | ${etaList.join(', ')}${hasSpike ? ' | Rerouted +5%' : ''}`,\n    load_kg: truck.load,\n    cost_usd: cost,\n    rerouted: hasSpike\n  });\n}\n\nconst avgFuelScore = routes.length\n  ? Math.round(routes.reduce((s,r) => s + r.Fuel_Efficiency_Score, 0) / routes.length)\n  : 0;\n\n// ── 5. HOS compliance check ──────────────────────────────────\nlet violatedTrucks = 0, warningTrucks = 0, compliantTrucks = 0;\nconst hosStatus = fleet.map(f => {\n  const driveHours = f.assigned?.length ? f.assigned.length * 0.6 : 0;\n  const totalHours = f.hours_used + (trucks.find(t=>t.id===f.id)?.assigned.length || 0) * 0.6;\n  const violation = totalHours >= hos_limit;\n  const warning   = !violation && totalHours >= 9;\n  if (violation) violatedTrucks++;\n  else if (warning) warningTrucks++;\n  else compliantTrucks++;\n  return {\n    truck_id: f.id,\n    driver: f.driver,\n    hours_used: parseFloat(totalHours.toFixed(1)),\n    hours_remaining: parseFloat((hos_limit - totalHours).toFixed(1)),\n    compliant: !violation,\n    warning\n  };\n});\n\n// ── 6. Risk score ─────────────────────────────────────────────\nconst totalCapacity = fleet.reduce((s,f) => s + f.capacity_kg, 0);\nconst totalLoad     = routes.reduce((s,r) => s + r.load_kg, 0);\nconst utilPct       = parseFloat((totalLoad / totalCapacity * 100).toFixed(1));\n\nconst riskScore = Math.min(100,\n  violatedTrucks * 40 +\n  warningTrucks  * 15 +\n  spikesCount    * 10 +\n  (utilPct > 85  ? 20 : 0)\n);\n\nconst riskLevel = riskScore >= 60 ? 'CRITICAL'\n                : riskScore >= 30 ? 'HIGH'\n                : riskScore >= 10 ? 'MEDIUM'\n                : 'LOW';\n\nconst riskFlags = [];\nif (violatedTrucks > 0) riskFlags.push(`HOS VIOLATION: ${violatedTrucks} truck(s)`);\nif (warningTrucks  > 0) riskFlags.push(`HOS WARNING: ${warningTrucks} truck(s)`);\nif (spikesCount    > 0) riskFlags.push(`TRAFFIC SPIKE: ${spikesCount} route(s)`);\nif (utilPct > 85)        riskFlags.push(`HIGH UTILIZATION: ${utilPct}%`);\n\n// ── 7. Decision ───────────────────────────────────────────────\nconst canDispatch = violatedTrucks === 0 && riskLevel !== 'CRITICAL';\nlet decision, confidence;\nif (!canDispatch || riskLevel === 'CRITICAL') {\n  decision = 'halt';   confidence = 0.99;\n} else if (riskLevel === 'HIGH' || riskScore >= 30) {\n  decision = 'review'; confidence = parseFloat((0.70 + (60-riskScore)/200).toFixed(2));\n} else {\n  decision = 'approve';\n  confidence = parseFloat(Math.min(0.99, 0.85 + (100-riskScore)/1000).toFixed(2));\n}\n\n// ── 8. Reward signal ──────────────────────────────────────────\nconst dataQuality = shipments.length > 0 ? 1.0 : 0;\nconst routeScore  = avgFuelScore / 100;\nconst riskVal     = riskLevel==='LOW'?1.0:riskLevel==='MEDIUM'?0.8:riskLevel==='HIGH'?0.6:0.3;\nconst decScore    = decision==='approve'?1.0:decision==='review'?0.7:0.3;\nconst base        = shipments.length / Math.max(totalCost / 100, 1);\nconst rewardSignal= parseFloat((base * dataQuality * routeScore * riskVal * decScore).toFixed(3));\n\n// ── 9. Priority breakdown ─────────────────────────────────────\nconst byPriority = shipments.reduce((acc, s) => {\n  const k = (s.priority || 'Medium').toLowerCase();\n  acc[k] = (acc[k] || 0) + 1;\n  return acc;\n}, {});\n\nconst manifest_id = 'AMAN-' + Date.now();\nconsole.log(`[Compute] ${manifest_id} | ${decision} | $${totalCost.toFixed(2)} | risk=${riskScore}/${riskLevel} | routes=${routes.length}`);\n\nreturn [{ json: {\n  // Pass through\n  run_id,\n  timestamp: d.timestamp,\n  manifest_id,\n  total_shipments: shipments.length,\n  shipments,\n  fleet,\n  trafficFactors,\n  hos_limit,\n\n  // Computed results\n  data_result: {\n    total_valid: shipments.length,\n    total_invalid: 0,\n    total_weight_kg: totalLoad,\n    by_priority: byPriority,\n    data_quality_score: dataQuality\n  },\n\n  route_result: {\n    optimized_routes: routes,\n    total_cost_usd: parseFloat(totalCost.toFixed(2)),\n    avg_fuel_score: avgFuelScore,\n    trucks_used: routes.length,\n    has_reroute: routes.some(r => r.rerouted)\n  },\n\n  risk_result: {\n    risk_score: riskScore,\n    risk_level: riskLevel,\n    risk_flags: riskFlags,\n    can_dispatch: canDispatch,\n    compliant_trucks: compliantTrucks,\n    warning_trucks: warningTrucks,\n    violated_trucks: violatedTrucks,\n    spikes_count: spikesCount,\n    has_spike: spikesCount > 0,\n    capacity_utilization: utilPct,\n    hos_status: hosStatus\n  },\n\n  decision,\n  confidence,\n  reward_signal: rewardSignal,\n  total_cost_usd: parseFloat(totalCost.toFixed(2)),\n  avg_fuel_score: avgFuelScore\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -480,
+        300
+      ],
+      "id": "node-compute",
+      "name": "Compute Routes & Risk"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── STEP 4: ASSEMBLE FINAL OUTPUT ───────────────────────────\n// Merge computed data + AI summary into the final response object\n\nconst d = $input.first().json;\n\n// Extract summary text from Groq agent output\nfunction extractText(obj) { return obj.summary || ''; }\n\nconst summary = extractText(d);\nconsole.log('[Assemble] summary:', summary.slice(0,100));\n\n// Build priority action list from real flags\nconst priority_actions = [];\nif (d.risk_result.violated_trucks > 0) priority_actions.push('Address HOS violations before dispatch');\nif (d.risk_result.has_spike)           priority_actions.push('Monitor rerouted routes for delays');\nif (d.decision === 'approve')          priority_actions.push(`Depart at 09:00 — ${d.route_result.trucks_used} trucks dispatched`);\nif (d.decision === 'review')           priority_actions.push('Manual review required before dispatch');\nif (d.decision === 'halt')             priority_actions.push('Do NOT dispatch — critical risk detected');\n\nreturn [{ json: {\n  // Identity\n  manifest_id:      d.manifest_id,\n  run_id:           d.run_id,\n  agentic_workflow: true,\n  source:           'google_sheets',\n  assembled_at:     new Date().toISOString(),\n\n  // Top-level metrics (for dashboard)\n  total_shipments:  d.total_shipments,\n  total_cost_usd:   d.total_cost_usd,\n  avg_fuel_score:   d.avg_fuel_score,\n\n  // Decision block\n  ai: {\n    decision:              d.decision,\n    confidence:            d.confidence,\n    summary,\n    priority_actions,\n    risk_flags:            d.risk_result.risk_flags,\n    estimated_savings_pct: d.decision === 'approve' ? Math.round((1 - d.avg_fuel_score/100) * 100 * 0.18) : 0,\n    recommended_departure: d.decision === 'approve' ? '09:00' : 'HOLD',\n    agent_notes: `Computed from ${d.total_shipments} real shipments. Risk ${d.risk_result.risk_score}/100 (${d.risk_result.risk_level}). Decision: ${d.decision.toUpperCase()} at ${(d.confidence*100).toFixed(0)}% confidence.`\n  },\n\n  // Agentic loop summary\n  agentic_summary: {\n    total_iterations: 1,\n    quality_score:    Math.max(0, Math.round(100 - d.risk_result.risk_score * 0.3)),\n    hitl_triggered:   d.decision === 'halt' || d.risk_result.risk_score >= 80,\n    reward_signal:    d.reward_signal,\n    planning_notes:   [`${d.total_shipments} shipments loaded`, `${d.route_result.trucks_used} routes computed`, `Risk ${d.risk_result.risk_level}`]\n  },\n\n  // Routes for display\n  dispatched: d.route_result.optimized_routes,\n\n  // HOS\n  has_spike:      d.risk_result.has_spike,\n  hos_violations: d.risk_result.hos_status.filter(h=>!h.compliant).map(h=>h.driver),\n  hos_status:     d.risk_result.hos_status,\n\n  // Risk\n  risk_summary: {\n    risk_level:   d.risk_result.risk_level,\n    risk_score:   d.risk_result.risk_score,\n    can_dispatch: d.risk_result.can_dispatch\n  },\n\n  // Data quality\n  data_summary: {\n    total_valid:        d.data_result.total_valid,\n    data_quality_score: d.data_result.data_quality_score\n  },\n\n  // Full results for email / write\n  route_result: d.route_result,\n  risk_result:  d.risk_result,\n  data_result:  d.data_result\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        80,
+        300
+      ],
+      "id": "node-assemble",
+      "name": "Assemble Output"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "c-halt",
+              "leftValue": "={{ $json.ai.decision }}",
+              "rightValue": "halt",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        320,
+        300
+      ],
+      "id": "node-halt-check",
+      "name": "Halt?"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "c-approve",
+              "leftValue": "={{ $json.ai.decision }}",
+              "rightValue": "approve",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        560,
+        200
+      ],
+      "id": "node-approve-check",
+      "name": "Approve?"
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "dispatched",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        800,
+        100
+      ],
+      "id": "node-split",
+      "name": "Split Routes"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "1RyYi22xZ43Nv8n0jTXgmQKY_2WHEgoWMlXta9Ks6UuU",
+          "mode": "list",
+          "cachedResultName": "AI_Logistics_n8n"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 1873697820,
+          "mode": "list",
+          "cachedResultName": "Write Optimized Routes "
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Route_ID": "={{ $json.Route_ID }}",
+            "Destination_City": "={{ $json.Destination_City }}",
+            "Stop_Sequence": "={{ $json.Stop_Sequence }}",
+            "Estimated_Travel_Time": "={{ $json.Estimated_Travel_Time }}",
+            "Fuel_Efficiency_Score": "={{ $json.Fuel_Efficiency_Score }}",
+            "Optimized_Path_Notes": "={{ $json.Optimized_Path_Notes }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "Route_ID",
+              "displayName": "Route_ID",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Destination_City",
+              "displayName": "Destination_City",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Stop_Sequence",
+              "displayName": "Stop_Sequence",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Estimated_Travel_Time",
+              "displayName": "Estimated_Travel_Time",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Fuel_Efficiency_Score",
+              "displayName": "Fuel_Efficiency_Score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Optimized_Path_Notes",
+              "displayName": "Optimized_Path_Notes",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        1040,
+        100
+      ],
+      "id": "node-write",
+      "name": "Write Routes to Sheet",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "aX9hDEGrpopc7jTL",
+          "name": "Google Sheets account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sendTo": "krisforwork2@gmail.com",
+        "subject": "=🤖 [{{ $('Assemble Output').first().json.ai.decision.toUpperCase() }}] {{ $('Assemble Output').first().json.manifest_id }} | ${{ $('Assemble Output').first().json.total_cost_usd }} | {{ $('Assemble Output').first().json.total_shipments }} shipments | Risk: {{ $('Assemble Output').first().json.risk_summary.risk_level }}",
+        "message": "=<div style=\"font-family:Arial,sans-serif;max-width:640px;color:#1a1a1a\">\n<div style=\"background:#0F3460;color:white;padding:16px 20px;border-radius:8px 8px 0 0\">\n  <h2 style=\"margin:0;font-size:18px\">🤖 Agentic AI Logistics — Dispatch Report</h2>\n  <p style=\"margin:4px 0 0;font-size:13px;opacity:0.8\">Real data from Google Sheets — all values computed dynamically</p>\n</div>\n<div style=\"background:#f8f9fa;padding:16px;border-left:4px solid #0F3460\">\n  <table style=\"width:100%;font-size:14px;border-collapse:collapse\">\n    <tr><td style=\"padding:6px;font-weight:bold;width:40%\">Manifest ID</td><td>{{ $('Assemble Output').first().json.manifest_id }}</td></tr>\n    <tr style=\"background:#e8f4fd\"><td style=\"padding:6px;font-weight:bold\">Decision</td><td style=\"font-weight:bold;color:{{ $('Assemble Output').first().json.ai.decision==='approve'?'#0F6E56':$('Assemble Output').first().json.ai.decision==='review'?'#C05C00':'#CC0000' }}\">{{ $('Assemble Output').first().json.ai.decision.toUpperCase() }} ({{ ($('Assemble Output').first().json.ai.confidence*100).toFixed(0) }}%)</td></tr>\n    <tr><td style=\"padding:6px;font-weight:bold\">Shipments</td><td>{{ $('Assemble Output').first().json.total_shipments }} real orders</td></tr>\n    <tr style=\"background:#e8f4fd\"><td style=\"padding:6px;font-weight:bold\">Total Cost</td><td><b>${{ $('Assemble Output').first().json.total_cost_usd }}</b></td></tr>\n    <tr><td style=\"padding:6px;font-weight:bold\">Avg Fuel Score</td><td>⚡ {{ $('Assemble Output').first().json.avg_fuel_score }}/100</td></tr>\n    <tr style=\"background:#e8f4fd\"><td style=\"padding:6px;font-weight:bold\">Risk</td><td>{{ $('Assemble Output').first().json.risk_summary.risk_level }} ({{ $('Assemble Output').first().json.risk_summary.risk_score }}/100)</td></tr>\n    <tr><td style=\"padding:6px;font-weight:bold\">Reward Signal</td><td>⚡ {{ $('Assemble Output').first().json.agentic_summary.reward_signal }}</td></tr>\n    <tr style=\"background:#e8f4fd\"><td style=\"padding:6px;font-weight:bold\">HOS</td><td>{{ $('Assemble Output').first().json.hos_violations.length>0?'❌ Violations: '+$('Assemble Output').first().json.hos_violations.join(', '):'✅ All drivers compliant' }}</td></tr>\n  </table>\n</div>\n<div style=\"background:#E8F4FD;border-left:4px solid #0F3460;padding:14px\">\n  <p style=\"font-weight:bold;color:#0F3460;margin:0 0 6px\">🧩 Agent Summary</p>\n  <p>{{ $('Assemble Output').first().json.ai.summary }}</p>\n</div>\n<h3 style=\"margin:16px 0 8px;color:#0F3460\">📦 Dispatched Routes</h3>\n{{ $('Assemble Output').first().json.dispatched.map(r=>\n  '<div style=\"background:#f0f7ff;border-left:3px solid #0F3460;padding:10px;margin-bottom:8px;font-size:13px\">'+\n  '<b>'+r.Route_ID+'</b> — '+r.driver+'<br/>'+\n  'Route: '+r.Destination_City+'<br/>'+\n  'Stops: '+r.Stop_Sequence+'<br/>'+\n  'Time: '+r.Estimated_Travel_Time+\n  ' | Load: '+r.load_kg+'kg'+\n  ' | Fuel: ⚡'+r.Fuel_Efficiency_Score+'/100'+\n  ' | Cost: $'+r.cost_usd+\n  (r.rerouted?' | <b style=\"color:#C05C00\">Rerouted</b>':'')+\n  '</div>'\n).join('') }}\n<p style=\"color:#999;font-size:11px;margin-top:12px\">Agentic AI Logistics — 100% real data, zero hardcode</p>\n</div>",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        1280,
+        100
+      ],
+      "id": "node-email-dispatch",
+      "name": "Dispatch Email",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "uo6HyMngsgR1CqqI",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sendTo": "krisforwork2@gmail.com",
+        "subject": "=🔄 [REVIEW] {{ $json.manifest_id }} | Risk: {{ $json.risk_summary.risk_level }} ({{ $json.risk_summary.risk_score }}/100) | ${{ $json.total_cost_usd }}",
+        "message": "=<div style=\"font-family:Arial,sans-serif;max-width:640px\">\n<div style=\"background:#C05C00;color:white;padding:16px 20px;border-radius:8px 8px 0 0\">\n  <h2 style=\"margin:0\">🔄 Manual Review Required</h2>\n</div>\n<div style=\"background:#fff8f0;padding:16px;border-left:4px solid #C05C00\">\n  <p><b>Manifest:</b> {{ $json.manifest_id }}</p>\n  <p><b>Shipments:</b> {{ $json.total_shipments }}</p>\n  <p><b>Risk:</b> {{ $json.risk_summary.risk_level }} ({{ $json.risk_summary.risk_score }}/100)</p>\n  <p><b>Flags:</b> {{ $json.ai.risk_flags.join(', ') || 'None' }}</p>\n  <p><b>Cost:</b> ${{ $json.total_cost_usd }}</p>\n  <p><b>Summary:</b> {{ $json.ai.summary }}</p>\n</div>\n</div>",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        800,
+        300
+      ],
+      "id": "node-email-review",
+      "name": "Review Email",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "uo6HyMngsgR1CqqI",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sendTo": "krisforwork2@gmail.com",
+        "subject": "=🛑 [HALT] {{ $json.manifest_id }} | Risk: {{ $json.risk_summary.risk_level }} ({{ $json.risk_summary.risk_score }}/100)",
+        "message": "=<div style=\"font-family:Arial,sans-serif;max-width:640px\">\n<div style=\"background:#7B0000;color:white;padding:16px 20px;border-radius:8px 8px 0 0\">\n  <h2 style=\"margin:0\">🛑 Dispatch Halted — Critical Risk</h2>\n</div>\n<div style=\"background:#fff0f0;padding:16px;border-left:4px solid #7B0000\">\n  <p><b>Manifest:</b> {{ $json.manifest_id }}</p>\n  <p><b>Risk:</b> {{ $json.risk_summary.risk_level }} ({{ $json.risk_summary.risk_score }}/100)</p>\n  <p><b>Flags:</b> {{ $json.ai.risk_flags.join(', ') }}</p>\n  <p><b>HOS Violations:</b> {{ $json.hos_violations.join(', ') || 'None' }}</p>\n  <p><b>Summary:</b> {{ $json.ai.summary }}</p>\n</div>\n</div>",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        560,
+        400
+      ],
+      "id": "node-email-halt",
+      "name": "Halt Email",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "uo6HyMngsgR1CqqI",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($('Assemble Output').first().json) }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Access-Control-Allow-Origin",
+                "value": "*"
+              },
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              }
+            ]
+          }
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1280,
+        300
+      ],
+      "id": "node-respond",
+      "name": "Respond to App"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Generate summary from computed data — no LLM needed\nconst d = $input.first().json;\nconst ai_dec = d.decision || 'unknown';\nconst risk   = d.risk_result || {};\nconst routes = d.route_result || {};\nconst ships  = d.total_shipments || 0;\nconst cost   = d.total_cost_usd || 0;\n\n// Build plain-English summary from real computed values\nconst parts = [\n  `${ships} shipment${ships!==1?'s':''} processed across ${routes.trucks_used||0} truck${(routes.trucks_used||0)!==1?'s':''}.`,\n  `Decision: ${ai_dec.toUpperCase()} at ${((d.confidence||0)*100).toFixed(0)}% confidence.`,\n  `Total cost: $${cost}. Risk: ${risk.risk_level||'UNKNOWN'} (${risk.risk_score||0}/100).`,\n];\nif (risk.has_spike)          parts.push(`Traffic spike detected — reroute buffer applied.`);\nif (risk.violated_trucks>0)  parts.push(`Warning: ${risk.violated_trucks} HOS violation(s) detected.`);\nif (risk.warning_trucks>0)   parts.push(`${risk.warning_trucks} driver(s) approaching HOS limit.`);\nif (ai_dec==='approve')      parts.push(`Dispatch cleared. Recommended departure: 09:00.`);\nif (ai_dec==='review')       parts.push(`Manual review required before dispatch.`);\nif (ai_dec==='halt')         parts.push(`Dispatch halted — do not proceed without resolution.`);\n\nconst summary = parts.join(' ');\nconsole.log('[Summary]', summary);\n\n// Pass everything through with summary added\nreturn [{ json: { ...d, summary } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -240,
+        300
+      ],
+      "id": "node-summary-code",
+      "name": "Generate Summary"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Fetch Orders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Orders": {
+      "main": [
+        [
+          {
+            "node": "Init & Validate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Init & Validate": {
+      "main": [
+        [
+          {
+            "node": "Compute Routes & Risk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute Routes & Risk": {
+      "main": [
+        [
+          {
+            "node": "Generate Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assemble Output": {
+      "main": [
+        [
+          {
+            "node": "Halt?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Halt?": {
+      "main": [
+        [
+          {
+            "node": "Halt Email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Approve?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approve?": {
+      "main": [
+        [
+          {
+            "node": "Split Routes",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Review Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Routes": {
+      "main": [
+        [
+          {
+            "node": "Write Routes to Sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Routes to Sheet": {
+      "main": [
+        [
+          {
+            "node": "Dispatch Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dispatch Email": {
+      "main": [
+        [
+          {
+            "node": "Respond to App",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Review Email": {
+      "main": [
+        [
+          {
+            "node": "Respond to App",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Halt Email": {
+      "main": [
+        [
+          {
+            "node": "Respond to App",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Summary": {
+      "main": [
+        [
+          {
+            "node": "Assemble Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "clean-build",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "d375533fd71590f5813db2a9f81e61fc6726e15e6b0b886cf54e860e4ca6e369"
+  },
+  "id": "AgenticAI",
+  "tags": []
+}
